@@ -5,11 +5,22 @@
 例如:
 13800138000#MyPass123
 """
-import requests
+
 import json
 import os
 import random
 import string
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import requests
+
+LOGIN_URL = "https://service.ipzan.com/users-login"
+SIGNIN_URL = "https://service.ipzan.com/home/userWallet-receive"
+ACCOUNT_ENV = "pzhttp"
+OBFUSCATION_SALT = "QWERIPZAN1290QWER"
+REQUEST_TIMEOUT = 10
+
 
 class Base64Obfuscator:
     def __init__(self):
@@ -17,10 +28,11 @@ class Base64Obfuscator:
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             "abcdefghijklmnopqrstuvwxyz"
             "0123456789+/"
-        )   
-    def utf16_to_utf8(self, s):
+        )
+
+    def utf16_to_utf8(self, text: str) -> str:
         result = []
-        for char in s:
+        for char in text:
             code = ord(char)
             if 0 < code <= 127:
                 result.append(char)
@@ -33,174 +45,204 @@ class Base64Obfuscator:
                 byte2 = chr(128 | (code >> 6) & 63)
                 byte3 = chr(128 | code & 63)
                 result.extend([byte1, byte2, byte3])
-        return ''.join(result)
-    
-    def utf8_to_utf16(self, s):
-        result = []
-        i = 0
-        while i < len(s):
-            byte = ord(s[i])
-            i += 1
-            if byte & 0x80 == 0:  
-                result.append(s[i-1])
-            elif (byte & 0xE0) == 0xC0:  
-                byte2 = ord(s[i])
-                i += 1
-                code = ((byte & 0x1F) << 6) | (byte2 & 0x3F)
-                result.append(chr(code))
-            elif (byte & 0xF0) == 0xE0:  
-                byte2 = ord(s[i])
-                byte3 = ord(s[i+1])
-                i += 2
-                code = ((byte & 0x0F) << 12) | ((byte2 & 0x3F) << 6) | (byte3 & 0x3F)
-                result.append(chr(code))
-        return ''.join(result)
-    
-    def encode(self, s):
-        if not s:
+        return "".join(result)
+
+    def encode(self, text: str) -> str:
+        if not text:
             return ""
-        
-        utf8_bytes = self.utf16_to_utf8(s)
-        i = 0
+
+        utf8_bytes = self.utf16_to_utf8(text)
+        index = 0
         result = []
-        n = len(utf8_bytes)
-        
-        while i < n:
-            o = ord(utf8_bytes[i])
-            i += 1
-            result.append(self.table[o >> 2])
-            
-            if i == n:
-                result.append(self.table[(o & 3) << 4])
-                result.append('==')
-                break
-            
-            s_byte = ord(utf8_bytes[i])
-            i += 1
-            if i == n:
-                result.append(self.table[(o & 3) << 4 | (s_byte >> 4) & 15])
-                result.append(self.table[(s_byte & 15) << 2])
-                result.append('=')
-                break
-            
-            a = ord(utf8_bytes[i])
-            i += 1
-            result.append(self.table[(o & 3) << 4 | (s_byte >> 4) & 15])
-            result.append(self.table[(s_byte & 15) << 2 | (a & 192) >> 6])
-            result.append(self.table[a & 63])
-        
-        return ''.join(result)
+        length = len(utf8_bytes)
 
-def generate_obfuscated_account(phone, password):
-    salt = "QWERIPZAN1290QWER"
-    concat = phone + salt + password
-    obfuscator = Base64Obfuscator()
-    encoded = obfuscator.encode(concat)
-    
-    hex_chars = string.hexdigits.lower()
-    t = ''.join(''.join(random.choice(hex_chars) for _ in range(12)) for _ in range(80))
-    
-    if len(t) < 400:
-        t += ''.join(random.choice(hex_chars) for _ in range(400 - len(t)))
-    else:
-        t = t[:400]
-    
-    part1 = t[:100]
-    part2 = encoded[:8]
-    part3 = t[100:200]
-    part4 = encoded[8:20]
-    part5 = t[200:300]
-    part6 = encoded[20:]
-    part7 = t[300:400]
-    
-    account = part1 + part2 + part3 + part4 + part5 + part6 + part7
-    return account
+        while index < length:
+            first = ord(utf8_bytes[index])
+            index += 1
+            result.append(self.table[first >> 2])
 
-def login(phone, password):
-    url = "https://service.ipzan.com/users-login"
-    obfuscated_account = generate_obfuscated_account(phone, password)
-    payload = {
-        "account": obfuscated_account,
-        "source": "ipzan-home-one"
-    }
+            if index == length:
+                result.append(self.table[(first & 3) << 4])
+                result.append("==")
+                break
+
+            second = ord(utf8_bytes[index])
+            index += 1
+            if index == length:
+                result.append(self.table[(first & 3) << 4 | (second >> 4) & 15])
+                result.append(self.table[(second & 15) << 2])
+                result.append("=")
+                break
+
+            third = ord(utf8_bytes[index])
+            index += 1
+            result.append(self.table[(first & 3) << 4 | (second >> 4) & 15])
+            result.append(self.table[(second & 15) << 2 | (third & 192) >> 6])
+            result.append(self.table[third & 63])
+
+        return "".join(result)
+
+
+@dataclass
+class Account:
+    phone: str
+    password: str
+
+
+def build_common_headers(token: Optional[str] = None) -> dict:
     headers = {
-        'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
-        'Accept': "application/json, text/plain, */*",
-        'Content-Type': "application/json",
-        'Accept-Language': "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-        'Authorization': "Bearer null",
-        'Content-Type': "application/json;charset=UTF-8",
-        'Origin': "https://www.ipzan.com",
-        'Referer': "https://www.ipzan.com/",
-        'Sec-Fetch-Dest': "empty",
-        'Sec-Fetch-Mode': "cors",
-        'Sec-Fetch-Site': "same-site",
-        'sec-ch-ua-mobile': "?0",
-        'sec-ch-ua-platform': "\"Windows\"",
-        'Cookie': "locale=en-us"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+        "Origin": "https://www.ipzan.com",
+        "Referer": "https://www.ipzan.com/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Cookie": "locale=en-us",
     }
+
+    if token is None:
+        headers["Authorization"] = "Bearer null"
+        headers["Content-Type"] = "application/json;charset=UTF-8"
+    else:
+        headers["Authorization"] = f"Bearer {token}"
+
+    return headers
+
+
+def generate_noise_hex(length: int = 400) -> str:
+    hex_chars = string.hexdigits.lower()
+    return "".join(random.choice(hex_chars) for _ in range(length))
+
+
+def generate_obfuscated_account(phone: str, password: str) -> str:
+    concat = phone + OBFUSCATION_SALT + password
+    encoded = Base64Obfuscator().encode(concat)
+
+    noise = generate_noise_hex(400)
+    # 与旧实现保持一致：将编码字符串分段插入到固定位置。
+    return (
+        noise[:100]
+        + encoded[:8]
+        + noise[100:200]
+        + encoded[8:20]
+        + noise[200:300]
+        + encoded[20:]
+        + noise[300:400]
+    )
+
+
+def login(phone: str, password: str) -> Optional[str]:
+    payload = {
+        "account": generate_obfuscated_account(phone, password),
+        "source": "ipzan-home-one",
+    }
+    headers = build_common_headers(token=None)
+
     try:
-        response = requests.post(url, data=json.dumps(payload), headers=headers, timeout=10)
+        response = requests.post(
+            LOGIN_URL,
+            data=json.dumps(payload),
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
         response.raise_for_status()
         data = response.json()
-        if data.get("code") == 0:
-            token = data["data"]["token"]
-            return token
-        else:
-            print(f"登录失败: {data.get('message', '未知错误')}")
-            return None
-    except Exception as e:
-        print(f"登录请求异常: {str(e)}")
+    except requests.RequestException as exc:
+        print(f"登录请求异常: {exc}")
+        return None
+    except ValueError:
+        print("登录响应非JSON格式")
         return None
 
-def sign_in(token):
-    url = "https://service.ipzan.com/home/userWallet-receive"
-    headers = {
-        'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
-        'Accept': "application/json, text/plain, */*",
-        'Accept-Language': "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-        'Authorization': f"Bearer {token}",
-        'Origin': "https://www.ipzan.com",
-        'Referer': "https://www.ipzan.com/",
-        'Sec-Fetch-Dest': "empty",
-        'Sec-Fetch-Mode': "cors",
-        'Sec-Fetch-Site': "same-site",
-        'sec-ch-ua-mobile': "?0",
-        'sec-ch-ua-platform': "\"Windows\"",
-        'Cookie': "locale=en-us"
-    }
+    if data.get("code") == 0:
+        return data.get("data", {}).get("token")
+
+    print(f"登录失败: {data.get('message', '未知错误')}")
+    return None
+
+
+def sign_in(token: str) -> bool:
+    headers = build_common_headers(token=token)
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(SIGNIN_URL, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
-        if data.get("code") == 0:
-            print("签到成功")
-        else:
-            print(f"签到失败: {data.get('message', '未知错误')}")
-    except Exception as e:
-        print(f"签到请求异常: {str(e)}")
+    except requests.RequestException as exc:
+        print(f"签到请求异常: {exc}")
+        return False
+    except ValueError:
+        print("签到响应非JSON格式")
+        return False
+
+    if data.get("code") == 0:
+        print("签到成功")
+        return True
+
+    print(f"签到失败: {data.get('message', '未知错误')}")
+    return False
+
+
+def parse_accounts(raw_text: str) -> Tuple[List[Account], List[str]]:
+    accounts: List[Account] = []
+    errors: List[str] = []
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    for idx, line in enumerate(lines, 1):
+        if "#" not in line:
+            errors.append(f"账号 {idx} 格式错误: {line} (应为 账号#密码)")
+            continue
+
+        phone, password = line.split("#", 1)
+        phone = phone.strip()
+        password = password.strip()
+
+        if not phone or not password:
+            errors.append(f"账号 {idx} 格式错误: {line} (账号或密码为空)")
+            continue
+
+        accounts.append(Account(phone=phone, password=password))
+
+    return accounts, errors
+
+
+def run() -> int:
+    raw_config = os.environ.get(ACCOUNT_ENV, "").strip()
+    if not raw_config:
+        print(f"未配置{ACCOUNT_ENV}变量")
+        return 1
+
+    accounts, parse_errors = parse_accounts(raw_config)
+    for error in parse_errors:
+        print(error)
+
+    if not accounts:
+        print("没有可用账号，任务结束")
+        return 1
+
+    print(f"📱 检测到 {len(accounts)} 个有效账号，开始签到...")
+    success_count = 0
+
+    for idx, account in enumerate(accounts, 1):
+        print(f"\n--- 账号 {idx}: {account.phone} ---")
+        token = login(account.phone, account.password)
+        if not token:
+            print("跳过签到")
+            continue
+
+        if sign_in(token):
+            success_count += 1
+
+    print(f"\n🎉 签到流程结束：成功 {success_count}/{len(accounts)}")
+    return 0
+
 
 if __name__ == "__main__":
-    pzhttp = os.environ.get('pzhttp', '').strip()
-    if not pzhttp:
-        print("未配置pzhttp变量")
-        exit(1)
-    
-    accounts = [line.strip() for line in pzhttp.split('\n') if line.strip()]
-    print(f"📱 检测到 {len(accounts)} 个账号，开始签到...")
-    
-    for idx, acc_line in enumerate(accounts, 1):
-        try:
-            phone, password = acc_line.split('#')
-            print(f"\n--- 账号 {idx}: {phone} ---")
-            token = login(phone, password)
-            if token:
-                sign_in(token)
-            else:
-                print("跳过签到")
-        except ValueError:
-            print(f"账号 {idx} 格式错误: {acc_line} (应为 账号#密码)")
-        except Exception as e:
-            print(f"账号 {idx} 处理异常: {str(e)}")
-    
-    print("\n🎉 所有账号签到完成")
+    raise SystemExit(run())
