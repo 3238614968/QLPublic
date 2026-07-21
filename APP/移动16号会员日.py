@@ -11,8 +11,11 @@
   复用主脚本 移动云盘.py 的环境变量 yunpan, 格式与主脚本一致:
       Authorization值#手机号   (多账号用 & 分隔)
 依赖:  pip3 install requests
-暂无真实响应，数据未作处理，等待后期更新
-一键取CK地址：https://ydyp.apisky.cn/
+一键取CK地址：https://ydyp.apisky.cn
+
+2026.07.21
+优化抢兑商品展示，增加商品展示
+
 
 Author: xiaohai
 Update: 2026.07.21
@@ -46,7 +49,7 @@ REFERER = (f'{BASE_URL}/portal/cloudCircle/index.html'
 # 抽奖循环上限
 MAX_LOTTERY_TIMES = 30
 
-UA = ('Mozilla/5.0 (Linux; Android 16; V23049RAD8C Build/TKQ1.221114.001; wv) '
+UA = ('Mozilla/5.0 (Linux; Android 13; 23049RAD8C Build/TKQ1.221114.001; wv) '
       'AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/108.0.5359.128 '
       'Mobile Safari/537.36 MCloudApp/12.4.0 AppLanguage/zh-CN')
 
@@ -236,6 +239,17 @@ def is_success(data):
     return False
 
 
+def extract_prize_name(data):
+    """从抽奖/中奖响应中提取奖品名(兼容多种字段)。"""
+    result = data.get('result') or data.get('data') or {}
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return (result.get('prizeName') or result.get('giftName')
+                or result.get('name') or result.get('desc') or '')
+    return ''
+
+
 def extract_message(data):
     for key in ('msg', 'message', 'respMsg', 'errMsg', 'desc'):
         if isinstance(data, dict) and data.get(key):
@@ -244,32 +258,33 @@ def extract_message(data):
 
 
 def do_lottery(session, jwt_token, logs):
-    """盲盒抽奖: 循环抽到无次数为止。首次打印原始响应以便核对字段。"""
+    """盲盒抽奖: 循环抽到无次数为止。首次打印原始响应以便核对字段。
+    中奖结果按奖品名分组统计, 避免逐条刷屏。"""
     url = f'{BASE_URL}/ycloud/mcloudday/blindbox/lottery'
     logs.append('\n🎁 盲盒抽奖')
     win_count = 0
+    prize_counter = {}  # 奖品名 -> 次数, 用于分组展示
     for i in range(1, MAX_LOTTERY_TIMES + 1):
         data = market_request(session, url, jwt_token, method='POST', payload={'client': '1'})
         if data is None:
-            logs.append(f'-第{i}次抽奖: 接口无响应, 停止')
+            logs.append(f'-第{i}次: 接口无响应, 停止')
             break
         if i == 1:
             # 响应结构未知, 首次完整打印(仅控制台, 不进推送日志)
             print(f'  [首次抽奖原始响应] {json.dumps(data, ensure_ascii=False)}')
         if is_success(data):
-            result = data.get('result') or data.get('data') or {}
-            prize_name = ''
-            if isinstance(result, dict):
-                prize_name = (result.get('prizeName') or result.get('giftName')
-                              or result.get('name') or result.get('desc') or '')
-            logs.append(f'-第{i}次: {prize_name or "抽奖成功"}')
+            prize_name = extract_prize_name(data)
+            prize_counter[prize_name] = prize_counter.get(prize_name, 0) + 1
             win_count += 1
             time.sleep(random.uniform(1.0, 2.0))
             continue
         # 非成功: 大概率是次数用尽, 停止循环
         msg = extract_message(data) or '无更多次数'
-        logs.append(f'-第{i}次: 停止({msg})')
+        logs.append(f'-停止原因: {msg}')
         break
+    # 分组展示中奖结果
+    for name, count in prize_counter.items():
+        logs.append(f'-{name or "未知奖品"} x{count}')
     logs.append(f'-累计抽奖 {win_count} 次')
 
 
@@ -291,47 +306,80 @@ def query_prize_log(session, jwt_token, logs):
     if not records:
         logs.append('-暂无中奖记录')
         return
-    for rec in records:
+    for idx, rec in enumerate(records, start=1):
         if not isinstance(rec, dict):
             continue
         name = rec.get('prizeName') or rec.get('giftName') or rec.get('name') or '未知奖品'
         t = rec.get('createTime') or rec.get('time') or rec.get('drawTime') or ''
-        logs.append(f'-{name} {t}'.rstrip())
+        logs.append(f'-{idx}. {name} {t}'.rstrip())
 
 
 def fetch_gift_list(session, jwt_token):
-    """取奖品列表原始数据(纯数据, 不打印); 失败返回 (None, 错误信息)"""
+    """取奖品列表原始数据(纯数据, 不打印); 失败返回 (None, 错误信息)。
+    响应 result 内含两个列表: nationalPrizeList(全网) + provPrizeList(省份), 合并返回。"""
     url = f'{BASE_URL}/ycloud/mcloudday/gift/list'
     data = market_request(session, url, jwt_token, method='GET')
     if not data or not is_success(data):
         return None, (extract_message(data) if data else '接口无响应')
-    result = data.get('result') or data.get('data') or []
-    gifts = result if isinstance(result, list) else (result.get('list') or result.get('gifts') or [])
-    return gifts, ''
+    container = data.get('result') or data.get('data') or {}
+    if not isinstance(container, dict):
+        container = {}
+    national = container.get('nationalPrizeList') or container.get('prizeList') or []
+    prov = container.get('provPrizeList') or []
+    return [g for g in (national + prov) if isinstance(g, dict)], ''
 
 
 def gift_fields(g):
-    """从单个奖品字典提取标准字段: (名称, prizeId, 是否需钻石会员)"""
-    name = g.get('giftName') or g.get('prizeName') or g.get('name') or '未知'
+    """从单个奖品字典提取标准字段(对齐真实 gift/list 响应)。
+    返回 (名称, prizeId, 是否需钻石会员, 是否有库存, 省份)。"""
+    name = g.get('prizeName') or g.get('giftName') or g.get('name') or '未知'
     pid = g.get('prizeId') or g.get('id') or ''
     need_vip = str(g.get('prizeType', '')) == '1'
-    return name, pid, need_vip
+    has_stock = bool(g.get('hasStock'))
+    prov = g.get('prov') or ''
+    return name, pid, need_vip, has_stock, prov
+
+
+def redeemable(g):
+    """判断奖品是否可抢兑: 普通奖品(prizeType!=1) 且 有库存(hasStock)"""
+    _, pid, need_vip, has_stock, _ = gift_fields(g)
+    return bool(pid) and not need_vip and has_stock
+
+
+def redeem_tag(g):
+    """生成可抢兑状态标签(全部展示但标注)"""
+    _, pid, need_vip, has_stock, _ = gift_fields(g)
+    if not pid:
+        return '缺ID'
+    if need_vip and not has_stock:
+        return '钻石·无货'
+    if need_vip:
+        return '钻石会员'
+    if not has_stock:
+        return '普通·无货'
+    return '可抢'
 
 
 def log_gift_list(gifts, logs):
-    """展示奖品列表(只读); prizeType==1 表示需钻石会员"""
-    logs.append('\n🛒 可抢兑奖品列表')
+    """展示全部奖品(可抢/不可抢都列出, 标注状态), 末尾汇总可抽数量"""
+    logs.append('\n🛒 奖品列表(全部展示, 标注状态)')
     if gifts is None:
         logs.append('-查询失败')
         return
     if not gifts:
-        logs.append('-暂无可抢兑奖品')
+        logs.append('-暂无奖品')
         return
+    redeem_count = 0
     for g in gifts:
         if not isinstance(g, dict):
             continue
-        name, pid, need_vip = gift_fields(g)
-        logs.append(f'-[{"钻石会员" if need_vip else "普通"}] {name} (prizeId={pid})')
+        name, pid, _, _, prov = gift_fields(g)
+        tag = redeem_tag(g)
+        if redeemable(g):
+            redeem_count += 1
+        prov_str = f'[{prov}]' if prov else ''
+        logs.append(f'-[{tag}]{prov_str} {name} (prizeId={pid})')
+    logs.append(f'-共 {len(gifts)} 个奖品, 其中可抢 {redeem_count} 个')
 
 
 def redeem_gifts(session, jwt_token, gifts, logs, confirm):
@@ -343,24 +391,27 @@ def redeem_gifts(session, jwt_token, gifts, logs, confirm):
     if not gifts:
         logs.append('-无奖品可抢兑')
         return
-    targets = []
-    for g in gifts:
-        if not isinstance(g, dict):
-            continue
-        _, pid, need_vip = gift_fields(g)
-        if need_vip or not pid:
-            continue
-        targets.append(g)
+    targets = [g for g in gifts if isinstance(g, dict) and redeemable(g)]
     if not targets:
-        logs.append('-无普通奖品(仅钻石会员专属或缺少prizeId)')
+        logs.append('-无可抢兑奖品(当前均为钻石专属/无库存/缺prizeId)')
         return
-    for g in targets:
-        name, pid, _ = gift_fields(g)
-        if not confirm:
+    if not confirm:
+        for g in targets:
+            name, pid, *_ = gift_fields(g)
             logs.append(f'-将抢兑: {name} (prizeId={pid})')
-            continue
-        redeem_one_gift(session, jwt_token, pid, name, logs)
+        logs.append(f'-待抢兑 {len(targets)} 个(测试模式未提交)')
+        return
+    # 真实提交: 统计成功/失败
+    ok_count, fail_count = 0, 0
+    for g in targets:
+        name, pid, *_ = gift_fields(g)
+        success = redeem_one_gift(session, jwt_token, pid, name, logs)
+        if success:
+            ok_count += 1
+        else:
+            fail_count += 1
         time.sleep(random.uniform(1.5, 3.0))
+    logs.append(f'-抢兑完成: 成功 {ok_count}, 失败 {fail_count}')
 
 
 def get_sms_code(session, jwt_token, prize_id):
@@ -385,22 +436,23 @@ def get_sms_code(session, jwt_token, prize_id):
 
 
 def redeem_one_gift(session, jwt_token, prize_id, name, logs):
-    """单个奖品抢兑: getSmsCode -> receive"""
+    """单个奖品抢兑: getSmsCode -> receive。返回是否成功。"""
     sms_code, err = get_sms_code(session, jwt_token, prize_id)
     if not sms_code:
         logs.append(f'-{name}: 取验证码失败({err})')
-        return
+        return False
     time.sleep(random.uniform(0.8, 1.5))
     url = f'{BASE_URL}/ycloud/mcloudday/gift/receive'
     data = market_request(session, url, jwt_token, method='POST',
                           payload={'prizeId': prize_id, 'smsCode': sms_code})
     if not data:
         logs.append(f'-{name}: 抢兑接口无响应')
-        return
+        return False
     if is_success(data):
         logs.append(f'-{name}: ✅抢兑成功')
-    else:
-        logs.append(f'-{name}: 抢兑失败({extract_message(data) or "未知"})')
+        return True
+    logs.append(f'-{name}: 抢兑失败({extract_message(data) or "未知"})')
+    return False
 
 
 # ============================ 账号编排 ============================
