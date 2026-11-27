@@ -31,8 +31,8 @@
 #     BT_YOMI_DEVICES   品牌型号覆盖，多账号 @ 分隔，格式 "品牌#型号"，缺省自动生成 📱
 #     BT_YOMI_NOTIFY    值为 "1" 时开启青龙通知 📢
 #     BT_YOMI_DEBUG    值为 "1" 时打印接口调试日志 🐞
-#     BT_YOMI_REPLY     值为 "0" 时跳过「回复帖子」任务（默认开启）✍️
-#     BT_YOMI_POST      值为 "0" 时跳过「腾粉圈内发帖」任务（默认开启）📝
+#     BT_YOMI_REPLY    仅设为 "1" 才启用「回复帖子」（默认关闭）✍️
+#     BT_YOMI_POST     仅设为 "1" 才启用「腾粉圈内发帖」（默认关闭）📝
 #     BT_YOMI_REPLY_MAX 回复条数硬上限（缺省以任务面板进度为准，最多 5 条）
 #
 # 📦 依赖安装（青龙面板 - 依赖管理 - Python3）：
@@ -124,8 +124,8 @@ CLIENT_TASKS = [
 # 圈子互动（回复帖子 / 腾粉圈内发帖）
 # ============================================================
 
-REPLY_ENABLED = os.environ.get('BT_YOMI_REPLY', '1') != '0'
-POST_ENABLED = os.environ.get('BT_YOMI_POST', '1') != '0'
+REPLY_ENABLED = os.environ.get('BT_YOMI_REPLY') == '1'
+POST_ENABLED = os.environ.get('BT_YOMI_POST') == '1'
 REPLY_MAX = int(os.environ.get('BT_YOMI_REPLY_MAX') or 0)   # 0 = 以任务面板进度为准
 
 COMMENT_POOL = [
@@ -603,6 +603,9 @@ def is_login_expired(resp: dict) -> bool:
 
 def run_social_tasks(acc: 'YomiAccount', panel: dict, done_descs: set) -> list:
     """回复帖子 + 腾粉圈内发帖，返回通知摘要行列表。✍️📝"""
+    if not (REPLY_ENABLED or POST_ENABLED):
+        return []
+
     phone, today = acc.phone, time.strftime('%Y-%m-%d')
     lines = []
     my_uid = str(acc.auth.get('userId') or '')
@@ -680,7 +683,7 @@ def run_social_tasks(acc: 'YomiAccount', panel: dict, done_descs: set) -> list:
         if reply_ok:
             lines.append(f'  ✍️ 回复帖子 {reply_ok} 条 (+{reply_ok}积分)')
     else:
-        log(f'⏭️ [{phone}] BT_YOMI_REPLY=0，跳过回复任务')
+        log(f'⏭️ [{phone}] 未显式启用回帖，跳过回复任务')
 
     # ---------- 2) 腾粉圈内发帖 📝 ----------
     post_ok = False
@@ -709,7 +712,7 @@ def run_social_tasks(acc: 'YomiAccount', panel: dict, done_descs: set) -> list:
         if post_ok:
             lines.append('  📝 腾粉圈内发帖 1 篇 (+2积分)')
     else:
-        log(f'⏭️ [{phone}] BT_YOMI_POST=0，跳过发帖任务')
+        log(f'⏭️ [{phone}] 未显式启用发帖，跳过发帖任务')
 
     if reply_ok or post_ok or commented or published:
         record['commented'] = commented
