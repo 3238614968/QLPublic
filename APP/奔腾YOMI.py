@@ -7,6 +7,8 @@
 # 🌟 功能一览（每日全自动）：
 #   ✅ 每日积分 / 成长值概览
 #   ✅ 任务列表完成态检查 + 客户端任务上报
+#   ✅ 圈子互动：回复帖子（每日最多 5 条，每条 +1 积分）✍️
+#   ✅ 圈子互动：腾粉圈内发帖（每日 1 篇，+2 积分 2 成长值）📝
 #   ✅ 车辆信息同步
 #
 # 🔑 环境变量（二选一，支持任意一种多账号写法）：
@@ -29,6 +31,9 @@
 #     BT_YOMI_DEVICES   品牌型号覆盖，多账号 @ 分隔，格式 "品牌#型号"，缺省自动生成 📱
 #     BT_YOMI_NOTIFY    值为 "1" 时开启青龙通知 📢
 #     BT_YOMI_DEBUG    值为 "1" 时打印接口调试日志 🐞
+#     BT_YOMI_REPLY     值为 "0" 时跳过「回复帖子」任务（默认开启）✍️
+#     BT_YOMI_POST      值为 "0" 时跳过「腾粉圈内发帖」任务（默认开启）📝
+#     BT_YOMI_REPLY_MAX 回复条数硬上限（缺省以任务面板进度为准，最多 5 条）
 #
 # 📦 依赖安装（青龙面板 - 依赖管理 - Python3）：
 #     curl_cffi
@@ -46,13 +51,15 @@ import json
 import os
 import random
 import re
+import struct
 import sys
 import time
 import uuid
+import zlib
 from pathlib import Path
 
 try:
-    from curl_cffi import requests as cffi_requests
+    from curl_cffi import requests as cffi_requests, CurlMime
 except ImportError:
     print('❌ 缺少依赖 curl_cffi，请在青龙【依赖管理-Python3】中安装后重试')
     sys.exit(1)
@@ -94,6 +101,13 @@ URL_H5_TASK_LIST = H5_HOST + H5_BASE + '/member/app/v1/member/getNoviceTaskList'
 URL_H5_POINTS = H5_HOST + H5_BASE + '/member/app/v1/member/getPointsDetails'
 URL_H5_GROWTH = H5_HOST + H5_BASE + '/member/app/v1/member/getGrowthDetails'
 
+# 圈子互动（回复帖子 / 腾粉圈内发帖）
+# 帖子列表与发帖走原生 BFF 网关（ApiServiceCircle），评论走 H5 网关（帖子详情页）
+URL_UPLOAD_IMG = BFF_HOST + BFF_BASE + '/service/app/v1/upload/uploadMultipleImgs'
+URL_CIRCLE_ARTICLES = BFF_HOST + BFF_BASE + '/circle/app/v1/circle/getArticles'
+URL_CIRCLE_PUBLISH = BFF_HOST + BFF_BASE + '/circle/app/v1/circle/addArticleNew'
+URL_H5_ARTICLE_COMMENT = H5_HOST + H5_BASE + '/circle/app/v1/circle/addComment'
+
 # 客户端任务上报定义
 CLIENT_TASKS = [
     {'taskId': '1', 'tacticsCode': 'PR-BT-Open_pentium', 'money': '', 'changeDesc': '打开购奔腾'},
@@ -105,6 +119,62 @@ CLIENT_TASKS = [
     {'taskId': '15', 'tacticsCode': 'PR-BT-Circle_friends_1', 'money': '50', 'changeDesc': '转发内容至朋友圈'},
     {'taskId': '20', 'tacticsCode': 'PR-BT-Circle_friends_2', 'money': '50', 'changeDesc': '转发内容至朋友圈'},
 ]
+
+# ============================================================
+# 圈子互动（回复帖子 / 腾粉圈内发帖）
+# ============================================================
+
+REPLY_ENABLED = os.environ.get('BT_YOMI_REPLY', '1') != '0'
+POST_ENABLED = os.environ.get('BT_YOMI_POST', '1') != '0'
+REPLY_MAX = int(os.environ.get('BT_YOMI_REPLY_MAX') or 0)   # 0 = 以任务面板进度为准
+
+COMMENT_POOL = [
+    '写得真好，支持一下 👍',
+    '学到了，感谢楼主分享～',
+    '不错不错，收藏了！',
+    '同款车主路过，深有同感 😄',
+    '内容很实用，顶一个！',
+    '支持支持，继续加油！',
+    '太赞了，正好用得上',
+    '前排支持，说得很到位 👌',
+    '路过学习一下，感谢分享',
+    '好文，帮顶！',
+    '这个必须支持一下呀 🚗',
+    '很有参考价值，谢谢楼主',
+]
+
+POST_POOL = [
+    '今天天气不错，开车出去转了一圈，心情舒畅，大家也要开心每一天呀 🚗☀️',
+    '分享一个用车小技巧：定期检查胎压，既省油又安全，车友们别忘了哦～',
+    '周末来了，带上家人来一场说走就走的短途自驾，风景很美，心情更好 😄',
+    '傍晚兜风最惬意了，音乐一开，一天的疲惫都没了，你们今晚开车兜风了吗？',
+    '刚做完保养回来，师傅很专业，服务也不错，用车体验越来越好啦 ✨',
+    '安全驾驶千万条，平安第一条，大家开车记得系好安全带哦 🚦',
+    '路上看到好多同款车，倍感亲切，车友们的用车生活都丰富多彩呀～',
+    '买车的点点滴滴都是回忆，陪伴才是最长情的告白，爱车也是家人 🚙💕',
+]
+
+
+def make_post_png(width: int = 256, height: int = 256, seed: int = 0) -> bytes:
+    """纯标准库生成一张渐变 PNG（发帖必须带图：App 端校验至少 1 张图片）"""
+    rnd = random.Random(seed)
+    c0 = [rnd.randrange(70, 200), rnd.randrange(70, 200), rnd.randrange(70, 200)]
+    c1 = [rnd.randrange(70, 200), rnd.randrange(70, 200), rnd.randrange(70, 200)]
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # filter type: None
+        t = y / max(1, height - 1)
+        for x in range(width):
+            u = x / max(1, width - 1) * 0.5 + t * 0.5
+            rows += bytes((int(c0[i] + (c1[i] - c0[i]) * u) for i in range(3)))
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        return (struct.pack('>I', len(payload)) + tag + payload
+                + struct.pack('>I', zlib.crc32(tag + payload) & 0xffffffff))
+
+    ihdr = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+            + chunk(b'IDAT', zlib.compress(bytes(rows), 6)) + chunk(b'IEND', b''))
 
 # ============================================================
 # 频控与运行时
@@ -315,6 +385,75 @@ class YomiAccount:
     def h5_get(self, url: str, params: dict | None = None, **kw) -> dict:
         return self._send('GET', url, channel='h5', params=params, **kw)
 
+    def h5_post(self, url: str, json_body: dict | None = None, **kw) -> dict:
+        return self._send('POST', url, channel='h5', json_body=json_body, **kw)
+
+    # ---------- 圈子互动（回复帖子 / 发帖） ----------
+    def circle_articles(self, acttype: str = 'BTWTYPE', page: int = 1, page_size: int = 20) -> list:
+        """腾粉圈帖子列表（原生 getArticles，type 省略=全部，与 App「奔腾吧」一致）"""
+        resp = self.native_get(URL_CIRCLE_ARTICLES,
+                               params={'acttype': acttype, 'page': page, 'pageSize': page_size})
+        if str(resp.get('code') or '') in SUCCESS_CODES and isinstance(resp.get('data'), list):
+            return [a for a in resp['data'] if isinstance(a, dict)]
+        debug(f'帖子列表异常: code={resp.get("code")} msg={resp.get("msg")}')
+        return []
+
+    def upload_image(self, data: bytes, filename: str = 'btyomi.png') -> str:
+        """上传图片（原生 multipart uploadMultipleImgs），返回第一个图片 URL"""
+        throttle('write')
+        ts = str(int(time.time() * 1000))
+        nonce = str(uuid.uuid4())
+        aign = calc_aign(ts, nonce)
+        headers = self._native_headers(ts, nonce, aign)
+        headers.pop('Content-Type', None)   # multipart boundary 交给 curl_cffi 装配
+        mp = CurlMime()
+        mp.addpart(name='isCcompressImg', content_type='text/plain', data='true')
+        mp.addpart(name='prefix', content_type='text/plain', data='/prod/app/common')
+        mp.addpart(name='files', filename=filename, content_type='image/png', data=data)
+        try:
+            resp = self.http.post(URL_UPLOAD_IMG, multipart=mp, headers=headers, timeout=60)
+            body = resp.json()
+        except Exception as exc:
+            debug(f'图片上传异常: {exc}')
+            return ''
+        debug(f'← upload: {json.dumps(body, ensure_ascii=False)[:200]}')
+        if str(body.get('code') or '') in SUCCESS_CODES:
+            urls = body.get('data') or []
+            if isinstance(urls, list) and urls:
+                return str(urls[0])
+        log(f'❌ [{self.phone}] 图片上传失败: code={body.get("code")} msg={body.get("msg")}')
+        return ''
+
+    def publish_article(self, imgurl: str, body_text: str) -> dict:
+        """腾粉圈内发帖（原生 addArticleNew，与 App 发布页 PublishCircleActivity 同款参数）"""
+        return self.native_post(URL_CIRCLE_PUBLISH,
+                                json_body={'imgurl': imgurl, 'varticlebody': body_text},
+                                throttle_kind='write')
+
+    def comment_article(self, artcleid: str, content: str) -> dict:
+        """回复帖子（H5 addComment，帖子详情页评论框同款参数；评论他人的帖子）"""
+        body = {'artcleid': artcleid, 'commentPkey': '', 'commentUserId': '',
+                'content': content, 'imgurl': ''}
+        return self.h5_post(URL_H5_ARTICLE_COMMENT, json_body=body, throttle_kind='write')
+
+    # ---------- 圈子互动防重记录 ----------
+    def social_record(self) -> dict:
+        try:
+            if (SESSION_DIR / f'social_{self.phone}.json').is_file():
+                return json.loads((SESSION_DIR / f'social_{self.phone}.json')
+                                  .read_text(encoding='utf-8'))
+        except Exception as exc:
+            debug(f'读取社交记录失败: {exc}')
+        return {'commented': {}, 'published': {}}
+
+    def save_social_record(self, record: dict) -> None:
+        try:
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            (SESSION_DIR / f'social_{self.phone}.json').write_text(
+                json.dumps(record, ensure_ascii=False, indent=1), encoding='utf-8')
+        except Exception as exc:
+            debug(f'保存社交记录失败: {exc}')
+
     # ---------- 登录 ----------
     def login(self) -> bool:
         if not re.fullmatch(r'(1[0-9])\d{9}', self.phone):
@@ -462,6 +601,123 @@ def is_login_expired(resp: dict) -> bool:
     return str(resp.get('code') or '') in LOGIN_REQUIRED_CODES
 
 
+def run_social_tasks(acc: 'YomiAccount', panel: dict, done_descs: set) -> list:
+    """回复帖子 + 腾粉圈内发帖，返回通知摘要行列表。✍️📝"""
+    phone, today = acc.phone, time.strftime('%Y-%m-%d')
+    lines = []
+    my_uid = str(acc.auth.get('userId') or '')
+    record = acc.social_record()
+    commented: dict = record.get('commented') or {}
+    published: dict = record.get('published') or {}
+    # 清理过期防重记录（评论保留 7 天，发帖只保留今天），保持文件小巧
+    expired_before = time.strftime('%Y-%m-%d', time.localtime(time.time() - 7 * 86400))
+    for key in list(commented):
+        if commented[key] < expired_before:
+            commented.pop(key)
+    record['published'] = published = {k: v for k, v in published.items() if k == today}
+
+    # —— 任务面板进度解析（如「回复(1/5)」）——
+    reply_done_panel, reply_total, has_reply_task = 0, 0, False
+    for name, finished in panel.items():
+        m = re.match(r'^回复\((\d+)/(\d+)\)', name)
+        if m:
+            reply_done_panel, reply_total = int(m.group(1)), int(m.group(2))
+            has_reply_task = True
+        elif re.match(r'^回复', name):
+            has_reply_task = True
+        if '发帖' in name:
+            if finished:
+                published.setdefault(today, 'panel:done')
+    flow_reply = sum(1 for d in done_descs if '回复' in d)
+    flow_post = any('发帖' in d for d in done_descs)
+
+    # ---------- 1) 回复帖子 ✍️ ----------
+    reply_ok = 0
+    if REPLY_ENABLED:
+        if not has_reply_task:
+            log(f'⏭️ [{phone}] 任务面板无「回复」任务（可能已完成或未解锁），跳过回复')
+        else:
+            total = reply_total or (REPLY_MAX or 5)
+            done = max(reply_done_panel, flow_reply)
+            remaining = total - done
+            if REPLY_MAX:
+                remaining = min(remaining, REPLY_MAX)
+            if remaining <= 0:
+                log(f'⏭️ [{phone}] 回复任务已完成（面板 {reply_done_panel}/{reply_total or "-"}，流水 {flow_reply} 条），跳过')
+            else:
+                log(f'✍️ [{phone}] 回复任务进度 {done}/{total}，准备回复 {remaining} 条 ...')
+                candidates = []
+                for page in (1, 2, 3):
+                    for a in acc.circle_articles(page=page):
+                        pkey = str(a.get('pkey') or '')
+                        creator = str(a.get('ncreator') or '')
+                        if not pkey or pkey in commented or (my_uid and creator == my_uid):
+                            continue
+                        candidates.append(pkey)
+                    if len(candidates) >= remaining + 2:
+                        break
+                used_comments = set()
+                for pkey in candidates:
+                    if reply_ok >= remaining:
+                        break
+                    pool = [c for c in COMMENT_POOL if c not in used_comments] or COMMENT_POOL
+                    content = random.Random(f'{phone}{today}{pkey}').choice(pool)
+                    used_comments.add(content)
+                    resp = acc.comment_article(pkey, content)
+                    code = str(resp.get('code') or '')
+                    if code in SUCCESS_CODES:
+                        reply_ok += 1
+                        commented[pkey] = today
+                        log(f'✅ [{phone}] 回复帖子成功（{reply_ok}/{remaining}）: {content}')
+                    else:
+                        if is_login_expired(resp):
+                            log(f'❌ [{phone}] 会话失效，停止回复任务')
+                            break
+                        msg = str(resp.get('msg') or '')
+                        log(f'⚠️ [{phone}] 回复帖子失败: code={code} msg={msg}')
+                        if any(k in msg for k in ('上限', '已回复', '频繁', '完成')):
+                            break
+        if reply_ok:
+            lines.append(f'  ✍️ 回复帖子 {reply_ok} 条 (+{reply_ok}积分)')
+    else:
+        log(f'⏭️ [{phone}] BT_YOMI_REPLY=0，跳过回复任务')
+
+    # ---------- 2) 腾粉圈内发帖 📝 ----------
+    post_ok = False
+    if POST_ENABLED:
+        if today in published:
+            log(f'⏭️ [{phone}] 今日已发过帖（{published.get(today)}），跳过发帖任务')
+        elif flow_post:
+            log(f'⏭️ [{phone}] 今日积分流水已有发帖记录，跳过发帖任务')
+        else:
+            log(f'📝 [{phone}] 腾粉圈内发帖任务，生成配图并发布 ...')
+            png = make_post_png(seed=int(hashlib.md5(f'{phone}{today}'.encode()).hexdigest()[:8], 16))
+            imgurl = acc.upload_image(png, filename=f'btyomi_{today}.png')
+            if imgurl:
+                seed = int(hashlib.md5(phone.encode()).hexdigest()[:8], 16)
+                day_shift = int(today.replace('-', '')) % len(POST_POOL)
+                text = POST_POOL[(seed + day_shift) % len(POST_POOL)]
+                resp = acc.publish_article(imgurl, text)
+                if str(resp.get('code') or '') in SUCCESS_CODES:
+                    post_ok = True
+                    published[today] = str(resp.get('data') or 'ok')[:64]
+                    log(f'✅ [{phone}] 发帖成功 🎉 {text}')
+                else:
+                    log(f'❌ [{phone}] 发帖失败: code={resp.get("code")} msg={resp.get("msg")}')
+            else:
+                log(f'❌ [{phone}] 配图上传失败，跳过发帖')
+        if post_ok:
+            lines.append('  📝 腾粉圈内发帖 1 篇 (+2积分)')
+    else:
+        log(f'⏭️ [{phone}] BT_YOMI_POST=0，跳过发帖任务')
+
+    if reply_ok or post_ok or commented or published:
+        record['commented'] = commented
+        record['published'] = published
+        acc.save_social_record(record)
+    return lines
+
+
 def run_account(index: int, phone: str, secret: str, brand: str, model: str) -> str:
     """跑一个账号，返回通知文本。🏁"""
     log('')
@@ -557,7 +813,15 @@ def run_account(index: int, phone: str, secret: str, brand: str, model: str) -> 
                 break
             log(f'❌ [{phone}] {desc} 上报失败: code={resp.get("code")} msg={resp.get("msg")}')
 
-    # 7) 汇总
+    # 7) 圈子互动：回复帖子 + 腾粉圈内发帖
+    social_lines = []
+    try:
+        social_lines = run_social_tasks(acc, panel, done_descs)
+    except Exception as exc:
+        log(f'❌ [{phone}] 圈子互动异常: {type(exc).__name__}: {exc}')
+        social_lines = [f'  ⚠️ 圈子互动异常 {type(exc).__name__}']
+
+    # 8) 汇总
     lines = [f'🚗 {nickname}（{phone[:3]}****{phone[-4:] if len(phone) >= 7 else phone}）']
     if summary_lines:
         lines.append('  ' + ' | '.join(summary_lines))
@@ -571,6 +835,7 @@ def run_account(index: int, phone: str, secret: str, brand: str, model: str) -> 
         lines.append(f'  ⏭️ 已完成跳过 {len(skipped)} 项')
     if not executed and not skipped:
         lines.append('  📋 今日暂无可上报的客户端任务')
+    lines.extend(social_lines)
     return '\n'.join(lines)
 
 
